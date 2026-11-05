@@ -1,0 +1,329 @@
+#include <algorithm>
+#include <cassert>
+#include <cmath>
+#include <cstddef>
+#include <deque>
+#include <print>
+#include <random>
+#include <vector>
+
+using usize = size_t;
+
+namespace sim {
+struct query {
+  usize left, right;
+  usize ts_in, t_start = 0, t_out = 0;
+  usize lock_wait = 0;
+
+  query(usize left, usize right, usize ts_in)
+      : left(left), right(right), ts_in(ts_in) {}
+};
+
+using History = std::vector<query>;
+
+struct MutexDistribution {
+  usize n;
+  std::vector<usize> starts;
+};
+
+usize simulate(usize start, History &hs, const MutexDistribution &md,
+               usize thread_count, usize a, usize b) {
+  assert(thread_count > 0);
+  assert(md.n > 0);
+  assert(!md.starts.empty());
+  assert(md.starts[0] == 0);
+  assert(md.starts.back() < md.n);
+
+  for (usize i = 1; i < md.starts.size(); ++i) {
+    assert(md.starts[i - 1] < md.starts[i]);
+  }
+
+  std::ranges::stable_sort(hs, std::less{}, &query::ts_in);
+
+  struct Worker {
+    query *job = nullptr;
+    usize first = 0, next = 0, last = 0;
+    usize ready_at = 0, asleep_since = 0;
+    bool asleep = false;
+  };
+
+  struct SimMutex {
+    bool busy = false;
+    std::deque<usize> waiters;
+  };
+
+  std::vector<Worker> workers(thread_count);
+  std::vector<SimMutex> locks(md.starts.size());
+
+  auto get_block = [&md](usize position) -> usize {
+    assert(position < md.n);
+    usize i = 0;
+
+    while (i + 1 < md.starts.size() && md.starts[i + 1] <= position)
+      ++i;
+    return i;
+  };
+
+  usize now = start, total_response = 0;
+  usize pending = 0, completed = 0;
+
+  auto grant_access = [&](Worker &worker) {
+    locks[worker.next++].busy = true;
+    worker.ready_at = now + b;
+
+    if (worker.next == worker.last + 1) {
+      worker.ready_at += (worker.job->right - worker.job->left + 1) * a;
+    }
+  };
+
+  while (completed < hs.size()) {
+    usize selected = workers.size();
+    usize event_time = 0;
+
+    for (usize i = 0; i < workers.size(); ++i) {
+      const auto &worker = workers[i];
+      if (worker.asleep || (!worker.job && pending == hs.size()))
+        continue;
+      const usize tm =
+          worker.job ? worker.ready_at : std::max(now, hs[pending].ts_in);
+      if (selected == workers.size() || tm < event_time) {
+        selected = i;
+        event_time = tm;
+      }
+    }
+    assert(selected < workers.size());
+    now = event_time;
+
+    auto &worker = workers[selected];
+    if (!worker.job) {
+      worker.job = &hs[pending++];
+      assert(worker.job->left <= worker.job->right);
+      assert(worker.job->right < md.n);
+      worker.job->t_start = now;
+      worker.job->lock_wait = 0;
+      worker.first = get_block(worker.job->left);
+      worker.next = worker.first;
+      worker.last = get_block(worker.job->right);
+    }
+
+    if (worker.next <= worker.last) {
+      auto &lock = locks[worker.next];
+      if (lock.busy) {
+        lock.waiters.push_back(selected);
+        worker.asleep = true;
+        worker.asleep_since = now;
+      } else {
+        grant_access(worker);
+      }
+      continue;
+    }
+
+    worker.job->t_out = now;
+    total_response += now - worker.job->ts_in;
+
+    for (usize i = worker.first; i <= worker.last; ++i) {
+      auto &lock = locks[i];
+      lock.busy = false;
+      if (!lock.waiters.empty()) {
+        auto &waiter = workers[lock.waiters.front()];
+        lock.waiters.pop_front();
+
+        waiter.job->lock_wait += now - waiter.asleep_since;
+        waiter.asleep = false;
+        grant_access(waiter);
+      }
+    }
+    worker.job = nullptr;
+    ++completed;
+  }
+
+  return total_response;
+}
+
+}; // namespace sim
+
+namespace {
+static constexpr usize kWorkers = 8;
+static constexpr usize kA = 1;
+static constexpr usize kB = 10;
+static constexpr usize kBlocksCount = 9;
+static constexpr usize kN = 1 << 14;
+static constexpr usize kSeed = 42;
+static constexpr usize kMeanArrivalInterval = 30;
+} // namespace
+
+usize score(sim::History &hs, const sim::MutexDistribution &md, usize workers) {
+  return sim::simulate(0, hs, md, workers, kA, kB);
+};
+
+sim::MutexDistribution search(sim::History &train, sim::MutexDistribution p,
+                              usize workers) {
+  auto best = score(train, p, workers);
+  bool improved = false;
+  usize evaluations = 1;
+  usize pass = 0;
+
+  do {
+    improved = false;
+    for (usize i = 1; i < p.starts.size(); ++i) {
+      const auto original = p.starts[i];
+      auto best_cut = original;
+      const auto limit = i + 1 < p.starts.size() ? p.starts[i + 1] : p.n;
+      for (auto cut = p.starts[i - 1] + 1; cut < limit; ++cut) {
+        if (cut == original)
+          continue;
+        p.starts[i] = cut;
+        const auto cost = score(train, p, workers);
+        ++evaluations;
+        if (cost < best) {
+          best = cost;
+          best_cut = cut;
+        }
+      }
+      p.starts[i] = best_cut;
+      improved |= best_cut != original;
+    }
+    std::println("search pass={} score={} evaluations={}", ++pass, best,
+                 evaluations);
+  } while (improved);
+  return p;
+}
+
+sim::MutexDistribution anneal(sim::History &train,
+                              sim::MutexDistribution current, usize workers) {
+  constexpr usize kSteps = 4'000;
+  constexpr usize kLogInterval = 100;
+  constexpr double kInitialTemperatureRatio = 0.005;
+  constexpr double kFinalTemperatureRatio = 0.01;
+  constexpr unsigned kSeed = 121345;
+
+  if (train.empty() || current.starts.size() < 2)
+    return current;
+
+  auto current_cost = score(train, current, workers);
+  auto best_cost = current_cost;
+  auto best = current;
+
+  const usize radius =
+      std::max<usize>(1, current.n / current.starts.size() / 4);
+  double temperature = std::max(1.0, kInitialTemperatureRatio * current_cost);
+  const double cooling = std::pow(kFinalTemperatureRatio, 1.0 / (kSteps - 1));
+  std::mt19937 rng(kSeed);
+  std::uniform_int_distribution<usize> pick_cut(1, current.starts.size() - 1);
+  std::uniform_real_distribution<double> probability(0.0, 1.0);
+
+  auto try_move = [&]() {
+    const auto i = pick_cut(rng);
+    const auto original = current.starts[i];
+    const auto limit =
+        i + 1 < current.starts.size() ? current.starts[i + 1] : current.n;
+    const auto left =
+        original - std::min(radius, original - current.starts[i - 1] - 1);
+    const auto right = original + std::min(radius, limit - original - 1);
+    if (left == right)
+      return;
+
+    auto cut = std::uniform_int_distribution<usize>(left, right - 1)(rng);
+    if (cut >= original)
+      ++cut;
+    current.starts[i] = cut;
+
+    const auto cost = score(train, current, workers);
+    if (cost > current_cost) {
+      const double delta = static_cast<double>(cost - current_cost);
+      if (probability(rng) >= std::exp(-delta / temperature)) {
+        current.starts[i] = original;
+        return;
+      }
+    }
+
+    current_cost = cost;
+    if (cost < best_cost) {
+      best_cost = cost;
+      best = current;
+    }
+  };
+
+  usize last_log_step = 0;
+  for (usize step = 1; step <= kSteps; ++step) {
+    const auto previous_best = best_cost;
+    try_move();
+    if (best_cost < previous_best && step - last_log_step >= kLogInterval) {
+      std::println("anneal step={}/{} best={}", step, kSteps, best_cost);
+      last_log_step = step;
+    }
+    temperature *= cooling;
+  }
+  return best;
+}
+
+sim::History make_history(usize seed, usize mean_arrival_interval) {
+  constexpr usize kBursts = 1'000;
+  constexpr usize kBurstSize = 8;
+  assert(mean_arrival_interval > 0);
+  const usize burst_period = kBurstSize * mean_arrival_interval;
+  constexpr usize kCentersPct[] = {5,  9,  14, 23, 31, 44,
+                                   50, 61, 69, 78, 87, 95};
+
+  std::mt19937 rng(seed);
+  std::discrete_distribution<usize> pick_center(
+      {6, 4, 5, 2, 4, 3, 6, 2, 5, 3, 2, 4});
+  auto draw = [&](usize lo, usize hi) {
+    return std::uniform_int_distribution<usize>(lo, hi)(rng);
+  };
+
+  sim::History history;
+  history.reserve(kBursts * kBurstSize);
+  for (usize burst = 0; burst < kBursts; ++burst) {
+    const usize center = kN * kCentersPct[pick_center(rng)] / 100;
+    assert(center >= 96 && kN - center >= 96);
+    for (usize j = 0; j < kBurstSize; ++j) {
+      usize left, right;
+      if (j == kBurstSize - 1 && burst % 8 == 0) {
+        left = center - draw(32, 96);
+        right = center + draw(32, 96) - 1;
+      } else if (j % 2 == 0) {
+        right = center - 1 - draw(0, 24);
+        left = right + 1 - draw(16, 64);
+      } else {
+        left = center + draw(0, 24);
+        right = left + draw(16, 64) - 1;
+      }
+      history.emplace_back(left, right, burst * burst_period + draw(0, 5));
+    }
+  }
+  return history;
+}
+
+sim::MutexDistribution make_uniform(usize size, usize blocks_count) {
+  assert(blocks_count >= 1 && size >= blocks_count);
+  sim::MutexDistribution result{size, {}};
+  result.starts.reserve(blocks_count);
+
+  const usize width = size / blocks_count;
+  const usize remainder = size % blocks_count;
+  usize start = 0;
+  for (usize i = 0; i < blocks_count; ++i) {
+    result.starts.push_back(start);
+    start += width + (i < remainder ? 1 : 0);
+  }
+  return result;
+}
+
+int main() {
+  auto history = make_history(kSeed, kMeanArrivalInterval);
+  auto uniform = make_uniform(kN, kBlocksCount);
+  auto uniform_score = score(history, uniform, kWorkers);
+
+  std::println("seed={} uniform_score={}", kSeed, uniform_score);
+  auto md = anneal(history, uniform, kWorkers);
+  auto anneal_score = score(history, md, kWorkers);
+
+  std::println("uniform_score= {}\nanneal_score = {}", uniform_score,
+               anneal_score);
+  for (usize i = 0; i < md.starts.size(); ++i) {
+    const auto end = i + 1 < md.starts.size() ? md.starts[i + 1] : md.n;
+    std::println("mutex {}: [{}, {}] ({} cells)", i, md.starts[i], end - 1,
+                 end - md.starts[i]);
+  }
+}
