@@ -3,8 +3,10 @@
 #include <cmath>
 #include <cstddef>
 #include <deque>
+#include <limits>
 #include <print>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
 using usize = size_t;
@@ -145,11 +147,11 @@ usize simulate(usize start, History &hs, const MutexDistribution &md,
 namespace {
 static constexpr usize kWorkers = 8;
 static constexpr usize kA = 1;
-static constexpr usize kB = 10;
+static constexpr usize kB = 3;
 static constexpr usize kBlocksCount = 9;
 static constexpr usize kN = 1 << 14;
 static constexpr usize kSeed = 42;
-static constexpr usize kMeanArrivalInterval = 30;
+static constexpr usize kMeanArrivalInterval = 50;
 } // namespace
 
 usize score(sim::History &hs, const sim::MutexDistribution &md, usize workers) {
@@ -257,7 +259,7 @@ sim::MutexDistribution anneal(sim::History &train,
   return best;
 }
 
-sim::History make_history(usize seed, usize mean_arrival_interval) {
+sim::History make_history_v1(usize seed, usize mean_arrival_interval) {
   constexpr usize kBursts = 1'000;
   constexpr usize kBurstSize = 8;
   assert(mean_arrival_interval > 0);
@@ -295,6 +297,28 @@ sim::History make_history(usize seed, usize mean_arrival_interval) {
   return history;
 }
 
+sim::History make_history_v2(usize seed, usize mean_arrival_interval) {
+  assert(mean_arrival_interval > 0);
+  constexpr auto kMaxTime = std::numeric_limits<usize>::max();
+  if (mean_arrival_interval - 1 > kMaxTime - mean_arrival_interval)
+    throw std::overflow_error("Arrival interval is too large");
+
+  auto history = make_history_v1(seed, 1);
+  std::mt19937_64 rng(seed);
+  std::uniform_int_distribution<usize> gap(1, mean_arrival_interval +
+                                                  (mean_arrival_interval - 1));
+
+  history.front().ts_in = 0;
+  for (usize i = 1; i < history.size(); ++i) {
+    const auto interval = gap(rng);
+    const auto previous = history[i - 1].ts_in;
+    if (interval > kMaxTime - previous)
+      throw std::overflow_error("Arrival time is too large");
+    history[i].ts_in = previous + interval;
+  }
+  return history;
+}
+
 sim::MutexDistribution make_uniform(usize size, usize blocks_count) {
   assert(blocks_count >= 1 && size >= blocks_count);
   sim::MutexDistribution result{size, {}};
@@ -310,8 +334,23 @@ sim::MutexDistribution make_uniform(usize size, usize blocks_count) {
   return result;
 }
 
+double mean_service_time(const sim::History &history,
+                         const sim::MutexDistribution &md) {
+  if (history.empty())
+    return 0.0;
+
+  usize total = 0;
+  for (const auto &q : history) {
+    const auto locks = 1 + std::ranges::count_if(md.starts, [&](usize cut) {
+                         return q.left < cut && cut <= q.right;
+                       });
+    total += (q.right - q.left + 1) * kA + locks * kB;
+  }
+  return static_cast<double>(total) / history.size();
+}
+
 int main() {
-  auto history = make_history(kSeed, kMeanArrivalInterval);
+  auto history = make_history_v2(kSeed, kMeanArrivalInterval);
   auto uniform = make_uniform(kN, kBlocksCount);
   auto uniform_score = score(history, uniform, kWorkers);
 
@@ -321,6 +360,14 @@ int main() {
 
   std::println("uniform_score= {}\nanneal_score = {}", uniform_score,
                anneal_score);
+  if (!history.empty()) {
+    const auto count = static_cast<double>(history.size());
+    std::println(
+        "uniform_mean_response = {:.3f}  uniform_mean_service = {:.3f}",
+        uniform_score / count, mean_service_time(history, uniform));
+    std::println("anneal_mean_response = {:.3f}  anneal_mean_service = {:.3f}",
+                 anneal_score / count, mean_service_time(history, md));
+  }
   for (usize i = 0; i < md.starts.size(); ++i) {
     const auto end = i + 1 < md.starts.size() ? md.starts[i + 1] : md.n;
     std::println("mutex {}: [{}, {}] ({} cells)", i, md.starts[i], end - 1,
