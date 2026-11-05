@@ -157,6 +157,7 @@ static constexpr usize kBlocksCount = 9;
 static constexpr usize kN = 1 << 14;
 static constexpr usize kSeed = 42;
 static constexpr usize kMeanArrivalInterval = 50;
+static constexpr usize kMaxTiming = 20'000;
 } // namespace
 
 usize score(sim::History &hs, const sim::MutexDistribution &md, usize workers) {
@@ -519,18 +520,21 @@ public:
 #endif
 
 template <typename Mutex = std::mutex>
-double bench_distribution(const sim::History &hs,
-                          const sim::MutexDistribution &md) {
+void bench_distribution(const char *name, const sim::History &hs,
+                        const sim::MutexDistribution &md) {
   constexpr usize kFull = 10'000;
   using Clock = std::chrono::steady_clock;
   const auto task_count = kFull * hs.size();
   if (task_count == 0)
-    return 0.0;
+    return;
 
   FixedLock<Mutex> locks(md);
   std::vector<usize> data(md.n);
   std::atomic<usize> next{0};
   std::vector<Clock::duration> elapsed(kWorkers);
+  std::vector<std::vector<usize>> counts(kWorkers,
+                                         std::vector<usize>(kMaxTiming + 1));
+  std::vector<usize> over_limits(kWorkers);
   std::barrier start(kWorkers);
   std::vector<std::thread> threads;
   for (usize tid = 0; tid < kWorkers; ++tid) {
@@ -542,10 +546,20 @@ double bench_distribution(const sim::History &hs,
         if (ticket >= task_count)
           break;
         const auto &q = hs[ticket % hs.size()];
+        const auto op_begin = Clock::now();
         locks.lock(q.left, q.right);
         for (usize i = q.left; i <= q.right; ++i)
           ++data[i];
         locks.unlock(q.left, q.right);
+        const auto timing = std::max<usize>(
+            1, static_cast<usize>(
+                   std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       Clock::now() - op_begin)
+                       .count()));
+        if (timing <= kMaxTiming)
+          ++counts[tid][timing];
+        else
+          ++over_limits[tid];
       }
       elapsed[tid] = Clock::now() - begin;
     });
@@ -554,9 +568,37 @@ double bench_distribution(const sim::History &hs,
     thread.join();
 
   Clock::duration total{};
-  for (auto time : elapsed)
-    total += time;
-  return std::chrono::duration<double, std::nano>(total).count() / task_count;
+  std::vector<usize> total_counts(kMaxTiming + 1);
+  usize over_limit = 0;
+  for (usize tid = 0; tid < kWorkers; ++tid) {
+    total += elapsed[tid];
+    over_limit += over_limits[tid];
+    for (usize timing = 1; timing <= kMaxTiming; ++timing)
+      total_counts[timing] += counts[tid][timing];
+  }
+
+  std::println("{}_mean_ns_per_op = {:.2f}", name,
+               std::chrono::duration<double, std::nano>(total).count() /
+                   task_count);
+  auto print_percentile = [&](usize percent) {
+    const auto target = static_cast<usize>(
+        std::ceil(static_cast<double>(task_count) * percent / 100.0));
+    usize accumulated = 0;
+    for (usize timing = 1; timing <= kMaxTiming; ++timing) {
+      accumulated += total_counts[timing];
+      if (accumulated >= target) {
+        std::println("{}_p{}_ns = {}", name, percent, timing);
+        return;
+      }
+    }
+    std::println("{}_p{}_ns = >{}", name, percent, kMaxTiming);
+  };
+  print_percentile(50);
+  print_percentile(75);
+  print_percentile(90);
+  print_percentile(95);
+  print_percentile(99);
+  std::println("{}_over_max = {}", name, over_limit);
 }
 
 void bench() {
@@ -564,11 +606,8 @@ void bench() {
   auto uniform = make_uniform(kN, kBlocksCount);
   auto md = anneal(history, uniform, kWorkers);
 
-  auto baseline = bench_distribution(history, uniform);
-  auto fast = bench_distribution(history, md);
-  std::println(
-      "uniform_mean_ns_per_op = {:.2f}\nanneal_mean_ns_per_op = {:.2f}",
-      baseline, fast);
+  bench_distribution("uniform", history, uniform);
+  bench_distribution("anneal", history, md);
 }
 
 int main() { bench(); }
