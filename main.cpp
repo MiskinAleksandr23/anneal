@@ -381,8 +381,12 @@ void example() {
 }
 
 template <typename Mutex = std::mutex> class FixedLock {
+  struct alignas(128) Slot {
+    Mutex mutex;
+  };
+
   std::vector<usize> block_of_;
-  std::vector<Mutex> locks_;
+  std::vector<Slot> locks_;
 
 public:
   explicit FixedLock(const sim::MutexDistribution &md)
@@ -395,14 +399,124 @@ public:
 
   void lock(usize left, usize right) {
     for (usize i = block_of_[left]; i <= block_of_[right]; ++i)
-      locks_[i].lock();
+      locks_[i].mutex.lock();
   }
 
   void unlock(usize left, usize right) {
     for (usize i = block_of_[right] + 1; i > block_of_[left]; --i)
-      locks_[i - 1].unlock();
+      locks_[i - 1].mutex.unlock();
   }
 };
+
+#if defined(__aarch64__)
+#include <arm_acle.h>
+#elif defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
+
+inline void spin_pause() noexcept {
+#if defined(__aarch64__)
+  __yield();
+#elif defined(__x86_64__) || defined(__i386__)
+  _mm_pause();
+#endif
+}
+
+#define RANDOM_BACKOFF
+
+#ifdef NAIVE
+struct Spinlock {
+  void lock() noexcept {
+    while (locked_.load(std::memory_order_relaxed) ||
+           locked_.exchange(true, std::memory_order_acquire)) {
+    }
+  }
+  void unlock() noexcept { locked_.store(false, std::memory_order_release); }
+
+  std::atomic<bool> locked_ = false;
+};
+#elifdef EXP_BACKOFF
+#define MIN_BACKOFF 4
+#define MAX_BACKOFF 1024
+class Spinlock {
+private:
+  // Lock is just an atomic bool
+  std::atomic<bool> locked{false};
+
+public:
+  // Locking mechanism
+  void lock() {
+    // Start backoff at MIN_BACKOFF iterations
+    int backoff_iters = MIN_BACKOFF;
+
+    // Keep trying
+    while (1) {
+      // Try and grab the lock
+      // Return if we get the lock
+      if (!locked.exchange(true, std::memory_order_acquire))
+        return;
+
+      // If we didn't get the lock, just read the value which gets cached
+      // locally. This leads to less traffic.
+      // Pause for an exponentially increasing number of iterations
+      do {
+        // Pause for some number of iterations
+        for (int i = 0; i < backoff_iters; i++)
+          spin_pause();
+
+        // Get the backoff iterations for next time
+        backoff_iters = std::min(backoff_iters << 1, MAX_BACKOFF);
+
+        // Check to see if the lock is free
+      } while (locked.load(std::memory_order_relaxed));
+    }
+  }
+
+  // Unlocking mechanism
+  // Just set the lock to free (false)
+  // Can also use the assignment operator
+  void unlock() { locked.store(false, std::memory_order_release); }
+};
+#elifdef RANDOM_BACKOFF
+class Spinlock {
+private:
+  // Lock is just an atomic bool
+  std::atomic<bool> locked{false};
+
+public:
+  // Locking mechanism
+  void lock() {
+    // Keep trying
+    while (1) {
+      // Try and grab the lock
+      // Exit if we got the lock
+      if (!locked.exchange(true, std::memory_order_acquire))
+        return;
+
+      // If we didn't get the lock, just read the value which gets cached
+      // locally. This leads to less traffic.
+      // Pause for a random number of iterations (between 4 and 1024)
+      do {
+        // Get a random number of iterations between 4 and 1024
+        static thread_local std::mt19937 rng{std::random_device{}()};
+        const int backoff_iters =
+            std::uniform_int_distribution<int>(4, 1024)(rng);
+
+        // Pause for some number of iterations
+        for (int i = 0; i < backoff_iters; i++)
+          spin_pause();
+
+        // Check to see if the lock is now free
+      } while (locked.load(std::memory_order_relaxed));
+    }
+  }
+
+  // Unlocking mechanism
+  // Just set the lock to free (false)
+  // Can also use the assignment operator
+  void unlock() { locked.store(false, std::memory_order_release); }
+};
+#endif
 
 template <typename Mutex = std::mutex>
 double bench_distribution(const sim::History &hs,
