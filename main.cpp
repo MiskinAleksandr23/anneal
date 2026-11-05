@@ -1,12 +1,17 @@
 #include <algorithm>
+#include <atomic>
+#include <barrier>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <deque>
 #include <limits>
+#include <mutex>
 #include <print>
 #include <random>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 using usize = size_t;
@@ -349,7 +354,7 @@ double mean_service_time(const sim::History &history,
   return static_cast<double>(total) / history.size();
 }
 
-int main() {
+void example() {
   auto history = make_history_v2(kSeed, kMeanArrivalInterval);
   auto uniform = make_uniform(kN, kBlocksCount);
   auto uniform_score = score(history, uniform, kWorkers);
@@ -374,3 +379,82 @@ int main() {
                  end - md.starts[i]);
   }
 }
+
+template <typename Mutex = std::mutex> class FixedLock {
+  std::vector<usize> block_of_;
+  std::vector<Mutex> locks_;
+
+public:
+  explicit FixedLock(const sim::MutexDistribution &md)
+      : block_of_(md.n), locks_(md.starts.size()) {
+    for (usize i = 0; i < md.starts.size(); ++i) {
+      const auto end = i + 1 < md.starts.size() ? md.starts[i + 1] : md.n;
+      std::fill(block_of_.begin() + md.starts[i], block_of_.begin() + end, i);
+    }
+  }
+
+  void lock(usize left, usize right) {
+    for (usize i = block_of_[left]; i <= block_of_[right]; ++i)
+      locks_[i].lock();
+  }
+
+  void unlock(usize left, usize right) {
+    for (usize i = block_of_[right] + 1; i > block_of_[left]; --i)
+      locks_[i - 1].unlock();
+  }
+};
+
+template <typename Mutex = std::mutex>
+double bench_distribution(const sim::History &hs,
+                          const sim::MutexDistribution &md) {
+  constexpr usize kFull = 10'000;
+  using Clock = std::chrono::steady_clock;
+  const auto task_count = kFull * hs.size();
+  if (task_count == 0)
+    return 0.0;
+
+  FixedLock<Mutex> locks(md);
+  std::vector<usize> data(md.n);
+  std::atomic<usize> next{0};
+  std::vector<Clock::duration> elapsed(kWorkers);
+  std::barrier start(kWorkers);
+  std::vector<std::thread> threads;
+  for (usize tid = 0; tid < kWorkers; ++tid) {
+    threads.emplace_back([&, tid] {
+      start.arrive_and_wait();
+      const auto begin = Clock::now();
+      for (;;) {
+        const auto ticket = next.fetch_add(1, std::memory_order_relaxed);
+        if (ticket >= task_count)
+          break;
+        const auto &q = hs[ticket % hs.size()];
+        locks.lock(q.left, q.right);
+        for (usize i = q.left; i <= q.right; ++i)
+          ++data[i];
+        locks.unlock(q.left, q.right);
+      }
+      elapsed[tid] = Clock::now() - begin;
+    });
+  }
+  for (auto &thread : threads)
+    thread.join();
+
+  Clock::duration total{};
+  for (auto time : elapsed)
+    total += time;
+  return std::chrono::duration<double, std::nano>(total).count() / task_count;
+}
+
+void bench() {
+  auto history = make_history_v2(kSeed, kMeanArrivalInterval);
+  auto uniform = make_uniform(kN, kBlocksCount);
+  auto md = anneal(history, uniform, kWorkers);
+
+  auto baseline = bench_distribution(history, uniform);
+  auto fast = bench_distribution(history, md);
+  std::println(
+      "uniform_mean_ns_per_op = {:.2f}\nanneal_mean_ns_per_op = {:.2f}",
+      baseline, fast);
+}
+
+int main() { bench(); }
