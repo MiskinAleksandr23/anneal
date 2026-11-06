@@ -190,8 +190,12 @@ sim::MutexDistribution search(sim::History &train, sim::MutexDistribution p,
       p.starts[i] = best_cut;
       improved |= best_cut != original;
     }
+#ifdef DEBUG_SEARCH_OUTPUT
     std::println("search pass={} score={} evaluations={}", ++pass, best,
                  evaluations);
+#else
+    ++pass;
+#endif
   } while (improved);
   return p;
 }
@@ -256,7 +260,9 @@ sim::MutexDistribution anneal(sim::History &train,
     const auto previous_best = best_cost;
     try_move();
     if (best_cost < previous_best && step - last_log_step >= kLogInterval) {
+#ifdef DEBUG_SEARCH_OUTPUT
       std::println("anneal step={}/{} best={}", step, kSteps, best_cost);
+#endif
       last_log_step = step;
     }
     temperature *= cooling;
@@ -320,6 +326,177 @@ sim::History make_history_v2(usize seed, usize mean_arrival_interval) {
     if (interval > kMaxTime - previous)
       throw std::overflow_error("Arrival time is too large");
     history[i].ts_in = previous + interval;
+  }
+  return history;
+}
+
+sim::History make_history_v3(usize seed, usize mean_arrival_interval) {
+  assert(mean_arrival_interval > 0);
+  constexpr usize kQueries = 8'000;
+  constexpr double kMeanQueryLength = 48.0;
+
+  std::mt19937_64 rng(seed);
+  std::exponential_distribution<double> arrival_gap(
+      1.0 / static_cast<double>(mean_arrival_interval));
+  std::geometric_distribution<usize> query_length(1.0 / kMeanQueryLength);
+
+  sim::History history;
+  history.reserve(kQueries);
+  usize now = 0;
+  for (usize i = 0; i < kQueries; ++i) {
+    now += std::max<usize>(1, static_cast<usize>(arrival_gap(rng)));
+    const usize length = std::min<usize>(query_length(rng), kN - 1) + 1;
+    const usize left =
+        std::uniform_int_distribution<usize>(0, kN - length)(rng);
+    history.emplace_back(left, left + length - 1, now);
+  }
+  return history;
+}
+
+sim::History make_history_v4(usize seed, usize mean_arrival_interval) {
+  assert(mean_arrival_interval > 0);
+  constexpr usize kQueries = 8'000;
+  constexpr int kMaxWalkStep = 128;
+
+  std::mt19937_64 rng(seed);
+  std::uniform_int_distribution<int> walk_step(-kMaxWalkStep, kMaxWalkStep);
+  std::uniform_int_distribution<usize> length_exponent(0, 12);
+  std::normal_distribution<double> local_offset(0.0,
+                                                static_cast<double>(kN) / 64.0);
+  std::bernoulli_distribution global_query(0.1);
+
+  sim::History history;
+  history.reserve(kQueries);
+  long long center = kN / 2;
+  for (usize i = 0; i < kQueries; ++i) {
+    center = std::clamp(center + walk_step(rng), 0LL,
+                        static_cast<long long>(kN - 1));
+    const usize length = usize{1} << length_exponent(rng);
+
+    long long left;
+    if (global_query(rng)) {
+      left = std::uniform_int_distribution<usize>(0, kN - length)(rng);
+    } else {
+      const long long max_left = static_cast<long long>(kN - length);
+      const long long proposed = center + std::llround(local_offset(rng)) -
+                                 static_cast<long long>(length) / 2;
+      left = std::clamp(proposed, 0LL, max_left);
+    }
+    history.emplace_back(static_cast<usize>(left),
+                         static_cast<usize>(left) + length - 1,
+                         i * mean_arrival_interval);
+  }
+  return history;
+}
+
+sim::History make_history_v5(usize seed, usize mean_arrival_interval) {
+  assert(mean_arrival_interval > 0);
+  constexpr usize kQueries = 8'192;
+  constexpr usize kPeriod = 512;
+  constexpr double kTwoPi = 6.28318530717958647692;
+
+  std::mt19937_64 rng(seed);
+  std::discrete_distribution<usize> pick_level(
+      {1, 2, 4, 8, 16, 32, 16, 8, 4, 2, 1});
+
+  sim::History history;
+  history.reserve(kQueries);
+  usize now = 0;
+  for (usize i = 0; i < kQueries; ++i) {
+    if (i != 0) {
+      const double phase =
+          static_cast<double>(i % kPeriod) / static_cast<double>(kPeriod);
+      const double gap_factor = 1.0 + 0.8 * std::sin(kTwoPi * phase);
+      const auto gap = static_cast<usize>(std::llround(
+          static_cast<double>(mean_arrival_interval) * gap_factor));
+      now += std::max<usize>(1, gap);
+    }
+
+    const usize length = usize{1} << pick_level(rng);
+    const usize block =
+        std::uniform_int_distribution<usize>(0, kN / length - 1)(rng);
+    const usize left = block * length;
+    history.emplace_back(left, left + length - 1, now);
+  }
+  return history;
+}
+
+sim::History make_history_v6(usize seed) {
+  constexpr usize kClients = 64;
+  constexpr usize kRounds = 128;
+  static_assert(kN % kClients == 0);
+  constexpr usize kRegionWidth = kN / kClients;
+
+  std::mt19937_64 rng(seed);
+  std::gamma_distribution<double> think_time(2.0, 30.0);
+  std::uniform_int_distribution<usize> local_length(1, 64);
+
+  sim::History history;
+  history.reserve(kClients * kRounds);
+  std::vector<usize> ready_at(kClients, 0);
+  for (usize round = 0; round < kRounds; ++round) {
+    for (usize client = 0; client < kClients; ++client) {
+      const usize ts_in = ready_at[client];
+      if (round % 16 == 0 && client % 8 == 0) {
+        history.emplace_back(0, kN - 1, ts_in);
+      } else {
+        const usize region_left = client * kRegionWidth;
+        const usize length = local_length(rng);
+        const usize left = std::uniform_int_distribution<usize>(
+            region_left, region_left + kRegionWidth - length)(rng);
+        history.emplace_back(left, left + length - 1, ts_in);
+      }
+      ready_at[client] +=
+          std::max<usize>(1, static_cast<usize>(std::llround(think_time(rng))));
+    }
+  }
+  return history;
+}
+
+sim::History make_history_v7(usize seed) {
+  constexpr usize kWaves = 512;
+  constexpr usize kLanes = 16;
+  static_assert(kN % kLanes == 0);
+  constexpr usize kLaneWidth = kN / kLanes;
+
+  std::mt19937_64 rng(seed);
+  std::uniform_int_distribution<usize> lane_query_length(64, 256);
+
+  sim::History history;
+  history.reserve(kWaves * (kLanes + 1));
+  for (usize wave = 0; wave < kWaves; ++wave) {
+    const usize base = wave * 128;
+    history.emplace_back(0, kN - 1, base + wave % 2);
+    for (usize lane = 0; lane < kLanes; ++lane) {
+      const usize lane_left = lane * kLaneWidth;
+      const usize length = lane_query_length(rng);
+      const usize left = std::uniform_int_distribution<usize>(
+          lane_left, lane_left + kLaneWidth - length)(rng);
+      history.emplace_back(left, left + length - 1, base + 1 - wave % 2);
+    }
+  }
+  return history;
+}
+
+sim::History make_history_v8(usize seed) {
+  constexpr usize kScans = 64;
+  constexpr usize kSteps = 128;
+  constexpr usize kStepInterval = 4;
+
+  std::mt19937_64 rng(seed);
+  std::uniform_int_distribution<usize> window_exponent(6, 9);
+
+  sim::History history;
+  history.reserve(kScans * kSteps);
+  for (usize scan = 0; scan < kScans; ++scan) {
+    const usize window = usize{1} << window_exponent(rng);
+    const usize max_left = kN - window;
+    for (usize step = 0; step < kSteps; ++step) {
+      const usize progress = scan % 2 == 0 ? step : kSteps - step - 1;
+      const usize left = max_left * progress / (kSteps - 1);
+      history.emplace_back(left, left + window - 1,
+                           (scan * kSteps + step) * kStepInterval);
+    }
   }
   return history;
 }
@@ -559,8 +736,9 @@ double bench_distribution(const sim::History &hs,
   return std::chrono::duration<double, std::nano>(total).count() / task_count;
 }
 
-void bench() {
-  auto history = make_history_v2(kSeed, kMeanArrivalInterval);
+void bench_history(usize version, const char *description,
+                   sim::History history) {
+  std::println("\nmake_history_v{}: {}", version, description);
   auto uniform = make_uniform(kN, kBlocksCount);
   auto md = anneal(history, uniform, kWorkers);
 
@@ -569,6 +747,25 @@ void bench() {
   std::println(
       "uniform_mean_ns_per_op = {:.2f}\nanneal_mean_ns_per_op = {:.2f}",
       baseline, fast);
+}
+
+void bench() {
+  bench_history(1, "bursts around weighted hot spots",
+                make_history_v1(kSeed, kMeanArrivalInterval));
+  bench_history(2, "hot-spot queries with uniform interarrival gaps",
+                make_history_v2(kSeed, kMeanArrivalInterval));
+  bench_history(3, "Poisson arrivals and geometric query lengths",
+                make_history_v3(kSeed, kMeanArrivalInterval));
+  bench_history(4, "random-walk hot spot with local and global queries",
+                make_history_v4(kSeed, kMeanArrivalInterval));
+  bench_history(5, "sinusoidal arrival gaps and power-of-two aligned queries",
+                make_history_v5(kSeed, kMeanArrivalInterval));
+  bench_history(6, "partitioned clients with periodic global queries",
+                make_history_v6(kSeed));
+  bench_history(7, "barrier waves with global and per-lane queries",
+                make_history_v7(kSeed));
+  bench_history(8, "alternating forward and backward range scans",
+                make_history_v8(kSeed));
 }
 
 int main() { bench(); }
