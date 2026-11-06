@@ -12,6 +12,7 @@
 #include <random>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using usize = size_t;
@@ -163,39 +164,6 @@ usize score(sim::History &hs, const sim::MutexDistribution &md, usize workers) {
   return sim::simulate(0, hs, md, workers, kA, kB);
 };
 
-sim::MutexDistribution search(sim::History &train, sim::MutexDistribution p,
-                              usize workers) {
-  auto best = score(train, p, workers);
-  bool improved = false;
-  usize evaluations = 1;
-  usize pass = 0;
-
-  do {
-    improved = false;
-    for (usize i = 1; i < p.starts.size(); ++i) {
-      const auto original = p.starts[i];
-      auto best_cut = original;
-      const auto limit = i + 1 < p.starts.size() ? p.starts[i + 1] : p.n;
-      for (auto cut = p.starts[i - 1] + 1; cut < limit; ++cut) {
-        if (cut == original)
-          continue;
-        p.starts[i] = cut;
-        const auto cost = score(train, p, workers);
-        ++evaluations;
-        if (cost < best) {
-          best = cost;
-          best_cut = cut;
-        }
-      }
-      p.starts[i] = best_cut;
-      improved |= best_cut != original;
-    }
-    std::println("search pass={} score={} evaluations={}", ++pass, best,
-                 evaluations);
-  } while (improved);
-  return p;
-}
-
 sim::MutexDistribution anneal(sim::History &train,
                               sim::MutexDistribution current, usize workers) {
   constexpr usize kSteps = 4'000;
@@ -262,6 +230,54 @@ sim::MutexDistribution anneal(sim::History &train,
     temperature *= cooling;
   }
   return best;
+}
+
+sim::MutexDistribution greedy(sim::History &train, usize workers, usize n,
+                              usize blocks_count, bool anneal_after = false) {
+  assert(blocks_count >= 1 && n >= blocks_count);
+  sim::MutexDistribution md{n, {}};
+  md.starts.reserve(blocks_count);
+  md.starts.push_back(0);
+  if (blocks_count == 1)
+    return md;
+
+  std::vector<usize> candidates;
+  candidates.reserve(train.size() * 4);
+  for (const auto &q : train) {
+    for (auto cut : {q.left, q.left + 1, q.right, q.right + 1}) {
+      if (cut > 0 && cut < n)
+        candidates.push_back(cut);
+    }
+  }
+  std::ranges::sort(candidates);
+  candidates.erase(std::unique(candidates.begin(), candidates.end()),
+                   candidates.end());
+
+  for (usize idx = 1; idx < blocks_count; ++idx) {
+    usize where = 0, best = std::numeric_limits<usize>::max();
+    for (auto cut : candidates) {
+      const auto it = std::ranges::lower_bound(md.starts, cut);
+      if (it != md.starts.end() && *it == cut)
+        continue;
+      const auto inserted = md.starts.insert(it, cut);
+      const auto cost = score(train, md, workers);
+      md.starts.erase(inserted);
+      if (where == 0 || cost < best) {
+        where = cut;
+        best = cost;
+      }
+    }
+    if (where == 0) {
+      where = 1;
+      while (std::ranges::binary_search(md.starts, where))
+        ++where;
+      assert(where < n);
+    }
+    md.starts.insert(std::ranges::lower_bound(md.starts, where), where);
+  }
+  if (anneal_after)
+    return anneal(train, std::move(md), workers);
+  return md;
 }
 
 sim::History make_history_v1(usize seed, usize mean_arrival_interval) {
@@ -354,24 +370,29 @@ double mean_service_time(const sim::History &history,
   return static_cast<double>(total) / history.size();
 }
 
-void example() {
+void example(bool anneal_after = false) {
   auto history = make_history_v2(kSeed, kMeanArrivalInterval);
   auto uniform = make_uniform(kN, kBlocksCount);
   auto uniform_score = score(history, uniform, kWorkers);
 
   std::println("seed={} uniform_score={}", kSeed, uniform_score);
-  auto md = anneal(history, uniform, kWorkers);
-  auto anneal_score = score(history, md, kWorkers);
+  auto annealed = anneal(history, uniform, kWorkers);
+  const auto anneal_score = score(history, annealed, kWorkers);
+  auto md = greedy(history, kWorkers, kN, kBlocksCount, anneal_after);
+  const auto optimized_score = score(history, md, kWorkers);
+  const auto name = anneal_after ? "greedy_anneal" : "greedy";
 
-  std::println("uniform_score= {}\nanneal_score = {}", uniform_score,
-               anneal_score);
+  std::println("uniform_score= {}\nanneal_score = {}\n{}_score = {}",
+               uniform_score, anneal_score, name, optimized_score);
   if (!history.empty()) {
     const auto count = static_cast<double>(history.size());
     std::println(
         "uniform_mean_response = {:.3f}  uniform_mean_service = {:.3f}",
         uniform_score / count, mean_service_time(history, uniform));
     std::println("anneal_mean_response = {:.3f}  anneal_mean_service = {:.3f}",
-                 anneal_score / count, mean_service_time(history, md));
+                 anneal_score / count, mean_service_time(history, annealed));
+    std::println("{}_mean_response = {:.3f}  {}_mean_service = {:.3f}", name,
+                 optimized_score / count, name, mean_service_time(history, md));
   }
   for (usize i = 0; i < md.starts.size(); ++i) {
     const auto end = i + 1 < md.starts.size() ? md.starts[i + 1] : md.n;
@@ -559,16 +580,20 @@ double bench_distribution(const sim::History &hs,
   return std::chrono::duration<double, std::nano>(total).count() / task_count;
 }
 
-void bench() {
+void bench(bool anneal_after = false) {
   auto history = make_history_v2(kSeed, kMeanArrivalInterval);
   auto uniform = make_uniform(kN, kBlocksCount);
-  auto md = anneal(history, uniform, kWorkers);
+  auto annealed = anneal(history, uniform, kWorkers);
+  auto md = greedy(history, kWorkers, kN, kBlocksCount, anneal_after);
+  const auto name = anneal_after ? "greedy_anneal" : "greedy";
 
   auto baseline = bench_distribution(history, uniform);
+  auto anneal_time = bench_distribution(history, annealed);
   auto fast = bench_distribution(history, md);
   std::println(
-      "uniform_mean_ns_per_op = {:.2f}\nanneal_mean_ns_per_op = {:.2f}",
-      baseline, fast);
+      "uniform_mean_ns_per_op = {:.2f}\nanneal_mean_ns_per_op = {:.2f}\n"
+      "{}_mean_ns_per_op = {:.2f}",
+      baseline, anneal_time, name, fast);
 }
 
-int main() { bench(); }
+int main() { bench(true); }
