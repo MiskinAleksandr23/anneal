@@ -20,11 +20,11 @@ using usize = size_t;
 namespace sim {
 struct query {
   usize left, right;
-  usize ts_in, t_start = 0, t_out = 0;
+  usize t_in, t_start = 0, t_out = 0;
   usize lock_wait = 0;
 
-  query(usize left, usize right, usize ts_in)
-      : left(left), right(right), ts_in(ts_in) {}
+  query(usize left, usize right, usize t_in)
+      : left(left), right(right), t_in(t_in) {}
 };
 
 using History = std::vector<query>;
@@ -32,6 +32,15 @@ using History = std::vector<query>;
 struct MutexDistribution {
   usize n;
   std::vector<usize> starts;
+
+  usize get_block(usize position) const {
+    assert(position < n);
+    usize i = 0;
+
+    while (i + 1 < starts.size() && starts[i + 1] <= position)
+      ++i;
+    return i;
+  };
 };
 
 usize simulate(usize start, History &hs, const MutexDistribution &md,
@@ -46,7 +55,7 @@ usize simulate(usize start, History &hs, const MutexDistribution &md,
     assert(md.starts[i - 1] < md.starts[i]);
   }
 
-  std::ranges::stable_sort(hs, std::less{}, &query::ts_in);
+  std::ranges::stable_sort(hs, std::less{}, &query::t_in);
 
   struct Worker {
     query *job = nullptr;
@@ -62,15 +71,6 @@ usize simulate(usize start, History &hs, const MutexDistribution &md,
 
   std::vector<Worker> workers(thread_count);
   std::vector<SimMutex> locks(md.starts.size());
-
-  auto get_block = [&md](usize position) -> usize {
-    assert(position < md.n);
-    usize i = 0;
-
-    while (i + 1 < md.starts.size() && md.starts[i + 1] <= position)
-      ++i;
-    return i;
-  };
 
   usize now = start, total_response = 0;
   usize pending = 0, completed = 0;
@@ -93,7 +93,7 @@ usize simulate(usize start, History &hs, const MutexDistribution &md,
       if (worker.asleep || (!worker.job && pending == hs.size()))
         continue;
       const usize tm =
-          worker.job ? worker.ready_at : std::max(now, hs[pending].ts_in);
+          worker.job ? worker.ready_at : std::max(now, hs[pending].t_in);
       if (selected == workers.size() || tm < event_time) {
         selected = i;
         event_time = tm;
@@ -109,9 +109,9 @@ usize simulate(usize start, History &hs, const MutexDistribution &md,
       assert(worker.job->right < md.n);
       worker.job->t_start = now;
       worker.job->lock_wait = 0;
-      worker.first = get_block(worker.job->left);
+      worker.first = md.get_block(worker.job->left);
       worker.next = worker.first;
-      worker.last = get_block(worker.job->right);
+      worker.last = md.get_block(worker.job->right);
     }
 
     if (worker.next <= worker.last) {
@@ -127,7 +127,7 @@ usize simulate(usize start, History &hs, const MutexDistribution &md,
     }
 
     worker.job->t_out = now;
-    total_response += now - worker.job->ts_in;
+    total_response += now - worker.job->t_in;
 
     for (usize i = worker.first; i <= worker.last; ++i) {
       auto &lock = locks[i];
@@ -160,9 +160,44 @@ static constexpr usize kSeed = 42;
 static constexpr usize kMeanArrivalInterval = 50;
 } // namespace
 
+#define SCORE_V1
+
+#ifdef SCORE_V1
 usize score(sim::History &hs, const sim::MutexDistribution &md, usize workers) {
   return sim::simulate(0, hs, md, workers, kA, kB);
 };
+
+// Q <- 100
+#elifdef SCORE_V2
+static constexpr usize kContationC = 1;
+usize score(sim::History &hs, const sim::MutexDistribution &md, usize workers) {
+  usize contation = 0;
+  sim::simulate(0, hs, md, workers, kA, kB);
+
+  auto blocks = [&](usize l, usize r) -> std::pair<usize, usize> {
+    assert(0 <= l && l <= r && r < md.n);
+    return {md.get_block(l), md.get_block(r)};
+  };
+
+  constexpr auto intersect = [](usize l1, usize r1, usize l2,
+                                usize r2) -> bool {
+    return l1 <= r2 && l2 <= r1;
+  };
+
+  for (usize i = 0; i < hs.size(); ++i) {
+    for (usize j = i + 1; j < hs.size(); ++j) {
+      auto [li, ri] = blocks(hs[i].left, hs[i].right);
+      auto [lj, rj] = blocks(hs[j].left, hs[j].right);
+      if (!intersect(li, ri, lj, rj))
+        continue;
+      if (hs[i].t_out <= hs[j].t_start || hs[j].t_out <= hs[i].t_start)
+        continue;
+      contation += kContationC;
+    }
+  }
+  return contation;
+};
+#endif
 
 sim::MutexDistribution anneal(sim::History &train,
                               sim::MutexDistribution current, usize workers) {
@@ -329,13 +364,13 @@ sim::History make_history_v2(usize seed, usize mean_arrival_interval) {
   std::uniform_int_distribution<usize> gap(1, mean_arrival_interval +
                                                   (mean_arrival_interval - 1));
 
-  history.front().ts_in = 0;
+  history.front().t_in = 0;
   for (usize i = 1; i < history.size(); ++i) {
     const auto interval = gap(rng);
-    const auto previous = history[i - 1].ts_in;
+    const auto previous = history[i - 1].t_in;
     if (interval > kMaxTime - previous)
       throw std::overflow_error("Arrival time is too large");
-    history[i].ts_in = previous + interval;
+    history[i].t_in = previous + interval;
   }
   return history;
 }
