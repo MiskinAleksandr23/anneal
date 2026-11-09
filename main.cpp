@@ -677,7 +677,14 @@ void bench(Workload workload, bool anneal_after) {
       baseline, anneal_time, name, fast);
 }
 
-int main() {
+template <typename Mutex = std::mutex>
+FixedLock<Mutex> GetTrainedLock(usize n, sim::History train, usize blocks_count,
+                                usize workers, bool anneal_after = false) {
+  return FixedLock<Mutex>(
+      greedy(train, workers, n, blocks_count, anneal_after));
+}
+
+void run_benches() {
   constexpr std::pair<Workload, const char *> workloads[] = {
       {Workload::Clustered, "Clustered"},
       {Workload::Skewed, "Skewed"},
@@ -690,4 +697,16 @@ int main() {
     std::println("workload={}", name);
     bench(workload, true);
   }
+}
+
+int main() {
+  auto hs = sim::History();
+  auto dl = GetTrainedLock(
+      /*n=*/kN,
+      /*train=*/std::move(hs),
+      /*blocks_count=*/kBlocksCount,
+      /*workers=*/kWorkers);
+
+  dl.lock(123, 127);
+  dl.unlock(123, 127);
 }
