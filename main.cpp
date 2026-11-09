@@ -49,7 +49,7 @@ struct SimulationStats {
 };
 
 SimulationStats simulate(usize start, History &hs, const MutexDistribution &md,
-                       usize thread_count, usize a, usize b) {
+                         usize thread_count, usize a, usize b) {
   assert(thread_count > 0);
   assert(md.n > 0);
   assert(!md.starts.empty());
@@ -165,6 +165,16 @@ static constexpr usize kBlocksCount = 9;
 static constexpr usize kN = 1 << 14;
 static constexpr usize kSeed = 42;
 static constexpr usize kMeanArrivalInterval = 50;
+static constexpr usize kHistorySize = 8'000;
+
+enum class Workload {
+  Clustered,
+  Skewed,
+  SharedCell,
+  MixedScans,
+  Sweep,
+  ShuffledSweep
+};
 } // namespace
 
 #define SCORE_V3
@@ -327,8 +337,9 @@ sim::MutexDistribution greedy(sim::History &train, usize workers, usize n,
 }
 
 sim::History make_history_v1(usize seed, usize mean_arrival_interval) {
-  constexpr usize kBursts = 1'000;
   constexpr usize kBurstSize = 8;
+  static_assert(kHistorySize % kBurstSize == 0);
+  constexpr usize kBursts = kHistorySize / kBurstSize;
   assert(mean_arrival_interval > 0);
   const usize burst_period = kBurstSize * mean_arrival_interval;
   constexpr usize kCentersPct[] = {5,  9,  14, 23, 31, 44,
@@ -364,13 +375,68 @@ sim::History make_history_v1(usize seed, usize mean_arrival_interval) {
   return history;
 }
 
-sim::History make_history_v2(usize seed, usize mean_arrival_interval) {
+sim::History make_ranges(Workload workload, usize seed) {
+  if (workload == Workload::Clustered)
+    return make_history_v1(seed, 1);
+
+  constexpr usize kStride = 32;
+  static_assert(kN >= 384);
+  constexpr usize kLastSlot = (kN - 1) / kStride;
+  std::mt19937 rng(seed);
+  auto draw = [&](usize lo, usize hi) {
+    return std::uniform_int_distribution<usize>(lo, hi)(rng);
+  };
+
+  sim::History history;
+  history.reserve(kHistorySize);
+  const usize sweep_start = draw(0, kLastSlot);
+  for (usize i = 0; i < kHistorySize; ++i) {
+    usize len = 16 * draw(1, 4);
+    usize left;
+    switch (workload) {
+    case Workload::Skewed: {
+      usize slot = kLastSlot;
+      for (usize j = 0; j < 4; ++j)
+        slot = std::min(slot, draw(0, kLastSlot));
+      left = slot * kStride;
+      break;
+    }
+    case Workload::SharedCell:
+      if (draw(0, 3) == 0) {
+        len = 16 * draw(2, 6);
+        left = kN / 4 - draw(0, len - 1);
+      } else {
+        left = draw((kLastSlot + 1) / 2, kLastSlot) * kStride;
+      }
+      break;
+    case Workload::MixedScans:
+      if (draw(0, 19) == 0)
+        len = 16 * draw(16, 24);
+      left = draw(0, kLastSlot) * kStride;
+      break;
+    case Workload::Sweep:
+    case Workload::ShuffledSweep:
+      left = ((sweep_start + i) % (kLastSlot + 1)) * kStride;
+      break;
+    default:
+      throw std::invalid_argument("Unknown workload");
+    }
+    left = std::min(left, kN - len);
+    history.emplace_back(left, left + len - 1, 0);
+  }
+  if (workload == Workload::ShuffledSweep)
+    std::shuffle(history.begin(), history.end(), rng);
+  return history;
+}
+
+sim::History make_history_v2(usize seed, usize mean_arrival_interval,
+                             Workload workload = Workload::Clustered) {
   assert(mean_arrival_interval > 0);
   constexpr auto kMaxTime = std::numeric_limits<usize>::max();
   if (mean_arrival_interval - 1 > kMaxTime - mean_arrival_interval)
     throw std::overflow_error("Arrival interval is too large");
 
-  auto history = make_history_v1(seed, 1);
+  auto history = make_ranges(workload, seed);
   std::mt19937_64 rng(seed);
   std::uniform_int_distribution<usize> gap(1, mean_arrival_interval +
                                                   (mean_arrival_interval - 1));
@@ -595,8 +661,8 @@ double bench_distribution(const sim::History &hs,
   return std::chrono::duration<double, std::nano>(total).count() / task_count;
 }
 
-void bench(bool anneal_after = false) {
-  auto history = make_history_v2(kSeed, kMeanArrivalInterval);
+void bench(Workload workload, bool anneal_after) {
+  auto history = make_history_v2(kSeed, kMeanArrivalInterval, workload);
   auto uniform = make_uniform(kN, kBlocksCount);
   auto annealed = anneal(history, uniform, kWorkers);
   auto md = greedy(history, kWorkers, kN, kBlocksCount, anneal_after);
@@ -611,4 +677,17 @@ void bench(bool anneal_after = false) {
       baseline, anneal_time, name, fast);
 }
 
-int main() { bench(true); }
+int main() {
+  constexpr std::pair<Workload, const char *> workloads[] = {
+      {Workload::Clustered, "Clustered"},
+      {Workload::Skewed, "Skewed"},
+      {Workload::SharedCell, "SharedCell"},
+      {Workload::MixedScans, "MixedScans"},
+      {Workload::Sweep, "Sweep"},
+      {Workload::ShuffledSweep, "ShuffledSweep"},
+  };
+  for (const auto &[workload, name] : workloads) {
+    std::println("workload={}", name);
+    bench(workload, true);
+  }
+}
