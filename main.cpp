@@ -43,12 +43,12 @@ struct MutexDistribution {
   };
 };
 
-struct SimulateStats {
+struct SimulationStats {
   usize time = 0;
   usize blocks_on_mutex = 0;
 };
 
-SimulateStats simulate(usize start, History &hs, const MutexDistribution &md,
+SimulationStats simulate(usize start, History &hs, const MutexDistribution &md,
                        usize thread_count, usize a, usize b) {
   assert(thread_count > 0);
   assert(md.n > 0);
