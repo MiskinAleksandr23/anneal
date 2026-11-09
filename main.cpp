@@ -43,14 +43,20 @@ struct MutexDistribution {
   };
 };
 
-usize simulate(usize start, History &hs, const MutexDistribution &md,
-               usize thread_count, usize a, usize b) {
+struct SimulateStats {
+  usize time = 0;
+  usize blocks_on_mutex = 0;
+};
+
+SimulateStats simulate(usize start, History &hs, const MutexDistribution &md,
+                       usize thread_count, usize a, usize b) {
   assert(thread_count > 0);
   assert(md.n > 0);
   assert(!md.starts.empty());
   assert(md.starts[0] == 0);
   assert(md.starts.back() < md.n);
 
+  usize blocks_on_mutex = 0;
   for (usize i = 1; i < md.starts.size(); ++i) {
     assert(md.starts[i - 1] < md.starts[i]);
   }
@@ -118,6 +124,7 @@ usize simulate(usize start, History &hs, const MutexDistribution &md,
       auto &lock = locks[worker.next];
       if (lock.busy) {
         lock.waiters.push_back(selected);
+        ++blocks_on_mutex;
         worker.asleep = true;
         worker.asleep_since = now;
       } else {
@@ -145,7 +152,7 @@ usize simulate(usize start, History &hs, const MutexDistribution &md,
     ++completed;
   }
 
-  return total_response;
+  return {total_response, blocks_on_mutex};
 }
 
 }; // namespace sim
@@ -160,11 +167,11 @@ static constexpr usize kSeed = 42;
 static constexpr usize kMeanArrivalInterval = 50;
 } // namespace
 
-#define SCORE_V1
+#define SCORE_V3
 
 #ifdef SCORE_V1
 usize score(sim::History &hs, const sim::MutexDistribution &md, usize workers) {
-  return sim::simulate(0, hs, md, workers, kA, kB);
+  return sim::simulate(0, hs, md, workers, kA, kB).time;
 };
 
 // Q <- 100
@@ -172,7 +179,7 @@ usize score(sim::History &hs, const sim::MutexDistribution &md, usize workers) {
 static constexpr usize kContationC = 1;
 usize score(sim::History &hs, const sim::MutexDistribution &md, usize workers) {
   usize contation = 0;
-  sim::simulate(0, hs, md, workers, kA, kB);
+  sim::simulate(0, hs, md, workers, kA, kB).time;
 
   auto blocks = [&](usize l, usize r) -> std::pair<usize, usize> {
     assert(0 <= l && l <= r && r < md.n);
@@ -196,6 +203,10 @@ usize score(sim::History &hs, const sim::MutexDistribution &md, usize workers) {
     }
   }
   return contation;
+};
+#elifdef SCORE_V3
+usize score(sim::History &hs, const sim::MutexDistribution &md, usize workers) {
+  return sim::simulate(0, hs, md, workers, kA, kB).blocks_on_mutex;
 };
 #endif
 
@@ -403,37 +414,6 @@ double mean_service_time(const sim::History &history,
     total += (q.right - q.left + 1) * kA + locks * kB;
   }
   return static_cast<double>(total) / history.size();
-}
-
-void example(bool anneal_after = false) {
-  auto history = make_history_v2(kSeed, kMeanArrivalInterval);
-  auto uniform = make_uniform(kN, kBlocksCount);
-  auto uniform_score = score(history, uniform, kWorkers);
-
-  std::println("seed={} uniform_score={}", kSeed, uniform_score);
-  auto annealed = anneal(history, uniform, kWorkers);
-  const auto anneal_score = score(history, annealed, kWorkers);
-  auto md = greedy(history, kWorkers, kN, kBlocksCount, anneal_after);
-  const auto optimized_score = score(history, md, kWorkers);
-  const auto name = anneal_after ? "greedy_anneal" : "greedy";
-
-  std::println("uniform_score= {}\nanneal_score = {}\n{}_score = {}",
-               uniform_score, anneal_score, name, optimized_score);
-  if (!history.empty()) {
-    const auto count = static_cast<double>(history.size());
-    std::println(
-        "uniform_mean_response = {:.3f}  uniform_mean_service = {:.3f}",
-        uniform_score / count, mean_service_time(history, uniform));
-    std::println("anneal_mean_response = {:.3f}  anneal_mean_service = {:.3f}",
-                 anneal_score / count, mean_service_time(history, annealed));
-    std::println("{}_mean_response = {:.3f}  {}_mean_service = {:.3f}", name,
-                 optimized_score / count, name, mean_service_time(history, md));
-  }
-  for (usize i = 0; i < md.starts.size(); ++i) {
-    const auto end = i + 1 < md.starts.size() ? md.starts[i + 1] : md.n;
-    std::println("mutex {}: [{}, {}] ({} cells)", i, md.starts[i], end - 1,
-                 end - md.starts[i]);
-  }
 }
 
 template <typename Mutex = std::mutex> class FixedLock {
