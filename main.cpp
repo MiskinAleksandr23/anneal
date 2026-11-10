@@ -20,7 +20,7 @@ using usize = size_t;
 namespace sim {
 struct query {
   usize left, right;
-  usize t_in, t_start = 0, t_out = 0;
+  usize t_in, t_out = 0, t_start = 0;
   usize lock_wait = 0;
 
   query(usize left, usize right, usize t_in)
@@ -304,7 +304,7 @@ sim::MutexDistribution make_uniform(usize size, usize blocks_count) {
 }
 
 sim::MutexDistribution greedy(sim::History &train, usize workers, usize n,
-                              usize blocks_count, bool anneal_after = false) {
+                              usize blocks_count, bool anneal_after = true) {
   assert(blocks_count >= 1 && n >= blocks_count);
   if (train.empty())
     return make_uniform(n, blocks_count);
@@ -682,7 +682,7 @@ void bench(Workload workload, bool anneal_after) {
 
 template <typename Mutex = std::mutex>
 FixedLock<Mutex> GetTrainedLock(usize n, sim::History train, usize blocks_count,
-                                usize workers, bool anneal_after = false) {
+                                usize workers, bool anneal_after = true) {
   return FixedLock<Mutex>(
       greedy(train, workers, n, blocks_count, anneal_after));
 }
