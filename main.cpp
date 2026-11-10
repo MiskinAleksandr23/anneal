@@ -288,9 +288,27 @@ sim::MutexDistribution anneal(sim::History &train,
   return best;
 }
 
+sim::MutexDistribution make_uniform(usize size, usize blocks_count) {
+  assert(blocks_count >= 1 && size >= blocks_count);
+  sim::MutexDistribution result{size, {}};
+  result.starts.reserve(blocks_count);
+
+  const usize width = size / blocks_count;
+  const usize remainder = size % blocks_count;
+  usize start = 0;
+  for (usize i = 0; i < blocks_count; ++i) {
+    result.starts.push_back(start);
+    start += width + (i < remainder ? 1 : 0);
+  }
+  return result;
+}
+
 sim::MutexDistribution greedy(sim::History &train, usize workers, usize n,
                               usize blocks_count, bool anneal_after = false) {
   assert(blocks_count >= 1 && n >= blocks_count);
+  if (train.empty())
+    return make_uniform(n, blocks_count);
+
   sim::MutexDistribution md{n, {}};
   md.starts.reserve(blocks_count);
   md.starts.push_back(0);
@@ -450,21 +468,6 @@ sim::History make_history_v2(usize seed, usize mean_arrival_interval,
     history[i].t_in = previous + interval;
   }
   return history;
-}
-
-sim::MutexDistribution make_uniform(usize size, usize blocks_count) {
-  assert(blocks_count >= 1 && size >= blocks_count);
-  sim::MutexDistribution result{size, {}};
-  result.starts.reserve(blocks_count);
-
-  const usize width = size / blocks_count;
-  const usize remainder = size % blocks_count;
-  usize start = 0;
-  for (usize i = 0; i < blocks_count; ++i) {
-    result.starts.push_back(start);
-    start += width + (i < remainder ? 1 : 0);
-  }
-  return result;
 }
 
 double mean_service_time(const sim::History &history,
